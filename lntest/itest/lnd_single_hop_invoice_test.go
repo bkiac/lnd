@@ -59,11 +59,13 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 		Index: chanPointBob.OutputIndex,
 	}
 
-	// Set the fee policy of the Bob -> Carol channel to zero
+	// Update fee policy of the Bob -> Carol channel
+	const baseFee = 1000
+	const feeRate = 10000
 	maxHtlc := calculateMaxHtlc(chanAmt)
 	updateChannelPolicy(
-		t, net.Bob, chanPointBob, 0, 0, chainreg.DefaultBitcoinTimeLockDelta,
-		maxHtlc, net.Alice,
+		t, net.Bob, chanPointBob, baseFee, feeRate,
+		chainreg.DefaultBitcoinTimeLockDelta, maxHtlc, net.Alice,
 	)
 
 	// Now that the channel is open, create an invoice for Carol which
@@ -135,14 +137,17 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// With the payment completed all balance related stats should be
 	// properly updated.
-	assertAmountPaid(t, "Bob(local) => Carol(remote)", carol, fundPointBob,
-		int64(0), paymentAmt)
+	expectedPayment := int64(paymentAmt)
+	assertAmountPaid(t, "Bob(local) => Carol(remote)", carol, fundPointBob, 0,
+		expectedPayment)
 	assertAmountPaid(t, "Bob(local) => Carol(remote)", net.Bob, fundPointBob,
-		paymentAmt, int64(0))
-	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Bob, fundPointAlice,
-		int64(0), paymentAmt)
+		expectedPayment, 0)
+	const fee = (baseFee / 1000) + (paymentAmt * feeRate / 1_000_000)
+	expectedPayment += fee
+	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Bob, fundPointAlice, 0,
+		expectedPayment)
 	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Alice, fundPointAlice,
-		paymentAmt, int64(0))
+		expectedPayment, 0)
 
 	// Create another invoice for Carol, this time leaving off the preimage
 	// to one will be randomly generated. We'll test the proper
@@ -169,14 +174,16 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// The second payment should also have succeeded, with the balances
 	// being update accordingly.
+	expectedPayment = int64(2 * paymentAmt)
 	assertAmountPaid(t, "Bob(local) => Carol(remote)", carol, fundPointBob,
-		int64(0), 2*paymentAmt)
+		int64(0), expectedPayment)
 	assertAmountPaid(t, "Bob(local) => Carol(remote)", net.Bob, fundPointBob,
-		2*paymentAmt, int64(0))
+		expectedPayment, int64(0))
+	expectedPayment += 2 * fee
 	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Bob, fundPointAlice,
-		int64(0), 2*paymentAmt)
+		int64(0), expectedPayment)
 	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Alice, fundPointAlice,
-		2*paymentAmt, int64(0))
+		expectedPayment, int64(0))
 
 	// Next send a keysend payment.
 	keySendPreimage := lntypes.Preimage{3, 4, 5, 11}
@@ -198,14 +205,16 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// The keysend payment should also have succeeded, with the balances
 	// being update accordingly.
+	expectedPayment = int64(3 * paymentAmt)
 	assertAmountPaid(t, "Bob(local) => Carol(remote)", carol, fundPointBob,
-		int64(0), 3*paymentAmt)
+		int64(0), expectedPayment)
 	assertAmountPaid(t, "Bob(local) => Carol(remote)", net.Bob, fundPointBob,
-		3*paymentAmt, int64(0))
+		expectedPayment, int64(0))
+	expectedPayment += 3 * fee
 	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Bob, fundPointAlice,
-		int64(0), 3*paymentAmt)
+		int64(0), expectedPayment)
 	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Alice, fundPointAlice,
-		3*paymentAmt, int64(0))
+		expectedPayment, int64(0))
 
 	// Assert that the invoice has the proper AMP fields set, since the
 	// legacy keysend payment should have been promoted into an AMP payment
