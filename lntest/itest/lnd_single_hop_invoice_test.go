@@ -4,14 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"time"
 
+	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
 	"github.com/davecgh/go-spew/spew"
+	"github.com/lightningnetwork/lnd/chainreg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
 	"github.com/lightningnetwork/lnd/lntest"
-	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
@@ -24,14 +24,49 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 	// Open a channel with 100k satoshis between Alice and Bob with Alice being
 	// the sole funder of the channel.
 	chanAmt := btcutil.Amount(100000)
-	chanPoint := openChannelAndAssert(
+	chanPointAlice := openChannelAndAssert(
 		t, net, net.Alice, net.Bob,
 		lntest.OpenChannelParams{
 			Amt: chanAmt,
 		},
 	)
+	txid, err := lnrpc.GetChanPointFundingTxid(chanPointAlice)
+	if err != nil {
+		t.Fatalf("unable to get txid: %v", err)
+	}
+	fundPointAlice := wire.OutPoint{
+		Hash:  *txid,
+		Index: chanPointAlice.OutputIndex,
+	}
 
-	// Now that the channel is open, create an invoice for Bob which
+	// Open a channel with 100k satoshis between Bob and Carol with Bob being
+	// the sole funder of the channel.
+	carol := net.NewNode(t.t, "Carol", nil)
+	defer shutdownAndAssert(net, t, carol)
+	net.ConnectNodes(t.t, net.Bob, carol)
+	chanPointBob := openChannelAndAssert(
+		t, net, net.Bob, carol,
+		lntest.OpenChannelParams{
+			Amt: chanAmt,
+		},
+	)
+	txid, err = lnrpc.GetChanPointFundingTxid(chanPointBob)
+	if err != nil {
+		t.Fatalf("unable to get txid: %v", err)
+	}
+	fundPointBob := wire.OutPoint{
+		Hash:  *txid,
+		Index: chanPointBob.OutputIndex,
+	}
+
+	// Set the fee policy of the Bob -> Carol channel to zero
+	maxHtlc := calculateMaxHtlc(chanAmt)
+	updateChannelPolicy(
+		t, net.Bob, chanPointBob, 0, 0, chainreg.DefaultBitcoinTimeLockDelta,
+		maxHtlc, net.Alice,
+	)
+
+	// Now that the channel is open, create an invoice for Carol which
 	// expects a payment of 1000 satoshis from Alice paid via a particular
 	// preimage.
 	const paymentAmt = 1000
@@ -41,26 +76,36 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 		RPreimage: preimage,
 		Value:     paymentAmt,
 	}
-	invoiceResp, err := net.Bob.AddInvoice(ctxb, invoice)
+	invoiceResp, err := carol.AddInvoice(ctxb, invoice)
 	if err != nil {
 		t.Fatalf("unable to add invoice: %v", err)
 	}
 
-	// Wait for Alice to recognize and advertise the new channel generated
-	// above.
+	// Wait for Alice, Bob and Carol to recognize
+	// and advertise the new channel generated above.
 	ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
-	err = net.Alice.WaitForNetworkChannelOpen(ctxt, chanPoint)
+	err = net.Alice.WaitForNetworkChannelOpen(ctxt, chanPointAlice)
 	if err != nil {
 		t.Fatalf("alice didn't advertise channel before "+
 			"timeout: %v", err)
 	}
-	err = net.Bob.WaitForNetworkChannelOpen(ctxt, chanPoint)
+	err = net.Bob.WaitForNetworkChannelOpen(ctxt, chanPointAlice)
 	if err != nil {
 		t.Fatalf("bob didn't advertise channel before "+
 			"timeout: %v", err)
 	}
+	err = net.Bob.WaitForNetworkChannelOpen(ctxt, chanPointBob)
+	if err != nil {
+		t.Fatalf("bob didn't advertise channel before "+
+			"timeout: %v", err)
+	}
+	err = carol.WaitForNetworkChannelOpen(ctxt, chanPointBob)
+	if err != nil {
+		t.Fatalf("carol didn't advertise channel before "+
+			"timeout: %v", err)
+	}
 
-	// With the invoice for Bob added, send a payment towards Alice paying
+	// With the invoice for Carol added, send a payment towards Alice paying
 	// to the above generated invoice.
 	resp := sendAndAssertSuccess(
 		t, net.Alice, &routerrpc.SendPaymentRequest{
@@ -74,31 +119,32 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 			resp.PaymentPreimage)
 	}
 
-	// Bob's invoice should now be found and marked as settled.
+	// Carol's invoice should now be found and marked as settled.
 	payHash := &lnrpc.PaymentHash{
 		RHash: invoiceResp.RHash,
 	}
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	dbInvoice, err := net.Bob.LookupInvoice(ctxt, payHash)
+	dbInvoice, err := carol.LookupInvoice(ctxt, payHash)
 	if err != nil {
 		t.Fatalf("unable to lookup invoice: %v", err)
 	}
 	if !dbInvoice.Settled { // nolint:staticcheck
-		t.Fatalf("bob's invoice should be marked as settled: %v",
+		t.Fatalf("carol's invoice should be marked as settled: %v",
 			spew.Sdump(dbInvoice))
 	}
 
 	// With the payment completed all balance related stats should be
 	// properly updated.
-	err = wait.NoError(
-		assertAmountSent(paymentAmt, net.Alice, net.Bob),
-		3*time.Second,
-	)
-	if err != nil {
-		t.Fatalf(err.Error())
-	}
+	assertAmountPaid(t, "Bob(local) => Carol(remote)", carol, fundPointBob,
+		int64(0), paymentAmt)
+	assertAmountPaid(t, "Bob(local) => Carol(remote)", net.Bob, fundPointBob,
+		paymentAmt, int64(0))
+	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Bob, fundPointAlice,
+		int64(0), paymentAmt)
+	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Alice, fundPointAlice,
+		paymentAmt, int64(0))
 
-	// Create another invoice for Bob, this time leaving off the preimage
+	// Create another invoice for Carol, this time leaving off the preimage
 	// to one will be randomly generated. We'll test the proper
 	// encoding/decoding of the zpay32 payment requests.
 	invoice = &lnrpc.Invoice{
@@ -106,7 +152,7 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 		Value: paymentAmt,
 	}
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	invoiceResp, err = net.Bob.AddInvoice(ctxt, invoice)
+	invoiceResp, err = carol.AddInvoice(ctxt, invoice)
 	if err != nil {
 		t.Fatalf("unable to add invoice: %v", err)
 	}
@@ -123,13 +169,14 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// The second payment should also have succeeded, with the balances
 	// being update accordingly.
-	err = wait.NoError(
-		assertAmountSent(2*paymentAmt, net.Alice, net.Bob),
-		3*time.Second,
-	)
-	if err != nil {
-		t.Fatalf(err.Error())
-	}
+	assertAmountPaid(t, "Bob(local) => Carol(remote)", carol, fundPointBob,
+		int64(0), 2*paymentAmt)
+	assertAmountPaid(t, "Bob(local) => Carol(remote)", net.Bob, fundPointBob,
+		2*paymentAmt, int64(0))
+	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Bob, fundPointAlice,
+		int64(0), 2*paymentAmt)
+	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Alice, fundPointAlice,
+		2*paymentAmt, int64(0))
 
 	// Next send a keysend payment.
 	keySendPreimage := lntypes.Preimage{3, 4, 5, 11}
@@ -137,7 +184,7 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 
 	sendAndAssertSuccess(
 		t, net.Alice, &routerrpc.SendPaymentRequest{
-			Dest:           net.Bob.PubKey[:],
+			Dest:           carol.PubKey[:],
 			Amt:            paymentAmt,
 			FinalCltvDelta: 40,
 			PaymentHash:    keySendHash[:],
@@ -151,19 +198,20 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// The keysend payment should also have succeeded, with the balances
 	// being update accordingly.
-	err = wait.NoError(
-		assertAmountSent(3*paymentAmt, net.Alice, net.Bob),
-		3*time.Second,
-	)
-	if err != nil {
-		t.Fatalf(err.Error())
-	}
+	assertAmountPaid(t, "Bob(local) => Carol(remote)", carol, fundPointBob,
+		int64(0), 3*paymentAmt)
+	assertAmountPaid(t, "Bob(local) => Carol(remote)", net.Bob, fundPointBob,
+		3*paymentAmt, int64(0))
+	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Bob, fundPointAlice,
+		int64(0), 3*paymentAmt)
+	assertAmountPaid(t, "Alice(local) => Bob(remote)", net.Alice, fundPointAlice,
+		3*paymentAmt, int64(0))
 
 	// Assert that the invoice has the proper AMP fields set, since the
 	// legacy keysend payment should have been promoted into an AMP payment
 	// internally.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	keysendInvoice, err := net.Bob.LookupInvoice(
+	keysendInvoice, err := carol.LookupInvoice(
 		ctxt, &lnrpc.PaymentHash{
 			RHash: keySendHash[:],
 		},
@@ -236,5 +284,6 @@ func testSingleHopInvoice(net *lntest.NetworkHarness, t *harnessTest) {
 			hopHint.CltvExpiryDelta)
 	}
 
-	closeChannelAndAssert(t, net, net.Alice, chanPoint, false)
+	closeChannelAndAssert(t, net, net.Alice, chanPointAlice, false)
+	closeChannelAndAssert(t, net, net.Bob, chanPointBob, false)
 }
